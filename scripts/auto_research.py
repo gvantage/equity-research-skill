@@ -289,18 +289,25 @@ def technical_analysis(bars):
 
 # ---------- 选股（基于实时数据的量化筛选） ----------
 
+# 说明：为避免"只按 PE/PB 选出一堆便宜银行股"的价值陷阱，PE/PB 从"硬门槛"降级为
+# "软因子"（仅保留宽松的理智上限用于剔除极端估值），并引入动量/关注度/板块强度多因子。
 DEFAULT_CRITERIA = {
-    "pe_min": 0.0,              # PE(TTM) 必须为正（盈利）
-    "pe_max": 40.0,            # PE 上限（估值不过高）
-    "pb_min": 0.0,             # PB 必须为正
-    "pb_max": 10.0,            # PB 上限
-    "min_total_mktcap_yi": 300.0,  # 总市值下限（亿元），保证流动性与稳健性
+    "pe_min": 0.0,              # 仍要求盈利（PE>0）；如需纳入亏损成长股可放开
+    "pe_max": 80.0,            # 宽松理智上限（非价值门槛），允许高成长/热点股进入
+    "pb_min": 0.0,
+    "pb_max": 20.0,
+    "min_total_mktcap_yi": 150.0,  # 总市值下限（亿元），兼顾流动性与中盘成长
     "exclude_st": True,        # 排除 ST/*ST（退市风险）
-    "pe_weight": 0.6,          # 价值分中低 PE 的权重
-    "pb_weight": 0.4,          # 价值分中低 PB 的权重
-    "tech_weight": 0.4,        # 综合分中技术面的权重（价值面权重=1-该值）
-    "kline_days": 120,         # 技术分析所需日线根数
-    "require_bullish": False,  # 是否只保留带看多技术信号的个股
+    "pe_weight": 0.6,          # 价值分内部：低 PE 权重
+    "pb_weight": 0.4,          # 价值分内部：低 PB 权重
+    "kline_days": 120,
+    "require_bullish": False,
+    # 多因子权重（内部会归一化到 1）：价值/技术/动量/板块热度/资金关注度
+    "w_value": 0.25,
+    "w_tech": 0.15,
+    "w_momentum": 0.25,
+    "w_sector": 0.20,
+    "w_heat": 0.15,
 }
 
 
@@ -314,12 +321,41 @@ def _ascending_scores(values):
     return scores
 
 
-def screen_universe(universe, criteria, count):
-    """先抓全池行情做基本面硬筛，再对通过者补充技术分析，最后按“价值+技术”综合评分排序取前 count。
+def _descending_scores(values):
+    """越大越好：返回每个值的 [0,1] 百分位得分（最大值=1.0）。None 记为最差。"""
+    n = len(values)
+    clean = [(-1e18 if v is None else v) for v in values]
+    order = sorted(range(n), key=lambda i: clean[i])  # 升序
+    scores = [0.0] * n
+    for rank, i in enumerate(order):
+        scores[i] = (rank / (n - 1)) if n > 1 else 0.5
+    return scores
 
-    返回 (selected, stats)：
-      selected：入选个股，每项含 stock/quote/tech/value_score/tech_score/score/rank/reason；
-      stats：{"n_universe","n_ok","n_passed","n_bullish","criteria"}，供报告展示。
+
+def _ret(bars, n):
+    closes = [b["close"] for b in bars]
+    if len(closes) <= n or closes[-1 - n] == 0:
+        return None
+    return (closes[-1] / closes[-1 - n] - 1) * 100
+
+
+def _volume_surge(bars):
+    """近5日均量 / 前20日均量，>1 表示放量（资金关注升温）。"""
+    vols = [b["volume"] for b in bars]
+    if len(vols) < 25:
+        return None
+    recent = sum(vols[-5:]) / 5
+    prior = sum(vols[-25:-5]) / 20
+    return recent / prior if prior else None
+
+
+def screen_universe(universe, criteria, count):
+    """多因子选股：基本面宽松硬筛 → 抓日线算技术/动量/关注度/板块强度 → 加权综合评分取前 count。
+
+    因子（均为通过池内的百分位打分，[0,1]）：
+      价值(低PE/低PB) · 技术(MACD/背离/均线/RSI) · 动量(20/60日相对强度)
+      · 资金关注度(换手率+放量) · 板块强度(同板块动量中位数)。
+    返回 (selected, stats)。
     """
     rows = [{"stock": stock, "quote": fetch_quote(stock)} for stock in universe]
 
@@ -340,16 +376,36 @@ def screen_universe(universe, criteria, count):
             continue
         passed.append(r)
 
-    # 仅对通过基本面的个股抓日线做技术分析（省请求）
+    # 仅对通过基本面的个股抓日线（省请求），计算技术/动量/放量
     for r in passed:
         secid = f"{r['stock']['market']}{r['stock']['code']}"
-        r["tech"] = technical_analysis(fetch_kline(secid, criteria["kline_days"]))
+        bars = fetch_kline(secid, criteria["kline_days"])
+        r["bars"] = bars
+        r["tech"] = technical_analysis(bars)
+        r["ret20"] = _ret(bars, 20)
+        r["ret60"] = _ret(bars, 60)
+        r["vol_surge"] = _volume_surge(bars)
+        # 相对强度：偏重近端
+        parts = [x for x in (r["ret20"], r["ret60"]) if x is not None]
+        r["rs"] = (0.6 * (r["ret20"] or 0) + 0.4 * (r["ret60"] or 0)) if parts else None
+
+    # 板块强度：同 sector 的 20 日动量中位数 → 板块热度百分位
+    from statistics import median
+    sector_moms = {}
+    for r in passed:
+        sec = r["stock"].get("sector", "-")
+        if r["ret20"] is not None:
+            sector_moms.setdefault(sec, []).append(r["ret20"])
+    sector_avg = {s: median(v) for s, v in sector_moms.items() if v}
+    sec_names = list(sector_avg)
+    sec_scores_list = _descending_scores([sector_avg[s] for s in sec_names]) if sec_names else []
+    sector_score_map = dict(zip(sec_names, sec_scores_list))
+    hot_sectors = sorted(sector_avg.items(), key=lambda kv: kv[1], reverse=True)
 
     n_bullish = sum(1 for r in passed if r.get("tech") and
                     (r["tech"]["bottom_div"] or r["tech"]["cross"] == "golden"
                      or (r["tech"]["ma20"] and r["tech"]["price"] > r["tech"]["ma20"])))
 
-    # 可选：仅保留带看多技术信号者
     ranked_pool = passed
     if criteria.get("require_bullish"):
         ranked_pool = [r for r in passed if r.get("tech") and
@@ -357,17 +413,35 @@ def screen_universe(universe, criteria, count):
                         or (r["tech"]["ma20"] and r["tech"]["price"] > r["tech"]["ma20"]))]
 
     if ranked_pool:
-        pe_scores = _ascending_scores([r["quote"]["pe_ttm"] for r in ranked_pool])
-        pb_scores = _ascending_scores([r["quote"]["pb"] for r in ranked_pool])
-        tw = criteria["tech_weight"]
+        # 归一化权重
+        wsum = (criteria["w_value"] + criteria["w_tech"] + criteria["w_momentum"]
+                + criteria["w_sector"] + criteria["w_heat"]) or 1.0
+        wv, wt, wm, ws, wh = (criteria["w_value"] / wsum, criteria["w_tech"] / wsum,
+                              criteria["w_momentum"] / wsum, criteria["w_sector"] / wsum,
+                              criteria["w_heat"] / wsum)
+        # 各因子池内百分位
+        pe_s = _ascending_scores([r["quote"]["pe_ttm"] for r in ranked_pool])
+        pb_s = _ascending_scores([r["quote"]["pb"] for r in ranked_pool])
+        rs_s = _descending_scores([r.get("rs") for r in ranked_pool])
+        turn_s = _descending_scores([r["quote"].get("turnover_pct") for r in ranked_pool])
+        surge_s = _descending_scores([r.get("vol_surge") for r in ranked_pool])
         for i, r in enumerate(ranked_pool):
-            value_score = criteria["pe_weight"] * pe_scores[i] + criteria["pb_weight"] * pb_scores[i]
+            value_score = criteria["pe_weight"] * pe_s[i] + criteria["pb_weight"] * pb_s[i]
             tech_score = r["tech"]["tech_score"] if r.get("tech") else 0.35
+            mom_score = rs_s[i]
+            heat_score = 0.5 * turn_s[i] + 0.5 * surge_s[i]
+            sector_score = sector_score_map.get(r["stock"].get("sector", "-"), 0.5)
             r["value_score"] = round(value_score, 4)
             r["tech_score"] = round(tech_score, 4)
-            r["score"] = round((1 - tw) * value_score + tw * tech_score, 4)
-            tsig = "、".join(r["tech"]["signals"][:2]) if r.get("tech") and r["tech"]["signals"] else "技术面中性"
-            r["reason"] = f"低PE({r['quote']['pe_ttm']:.1f})/低PB({r['quote']['pb']:.2f})；{tsig}"
+            r["mom_score"] = round(mom_score, 4)
+            r["heat_score"] = round(heat_score, 4)
+            r["sector_score"] = round(sector_score, 4)
+            r["score"] = round(wv * value_score + wt * tech_score + wm * mom_score
+                               + ws * sector_score + wh * heat_score, 4)
+            # 价值陷阱：便宜(价值分高)但动量与板块双弱
+            r["value_trap"] = (value_score >= 0.6 and mom_score <= 0.3 and sector_score <= 0.4)
+            r["reason"] = (f"价值{value_score:.2f}/技术{tech_score:.2f}/动量{mom_score:.2f}"
+                           f"/板块{sector_score:.2f}/关注{heat_score:.2f}")
         ranked_pool.sort(key=lambda r: r["score"], reverse=True)
 
     selected = ranked_pool[:count]
@@ -375,7 +449,7 @@ def screen_universe(universe, criteria, count):
         r["rank"] = rank
     n_ok = sum(1 for r in rows if r["quote"].get("ok"))
     stats = {"n_universe": len(rows), "n_ok": n_ok, "n_passed": len(passed),
-             "n_bullish": n_bullish, "criteria": criteria}
+             "n_bullish": n_bullish, "hot_sectors": hot_sectors[:6], "criteria": criteria}
     return selected, stats
 
 
@@ -408,7 +482,7 @@ JSON_SCHEMA_HINT = (
 )
 
 
-def build_messages(stock, quote, date, tech=None):
+def build_messages(stock, quote, date, tech=None, factors=None):
     facts = {
         "日期": str(date),
         "代码": f"{stock['market'].upper()}{stock['code']}",
@@ -424,6 +498,17 @@ def build_messages(stock, quote, date, tech=None):
         "数据源": quote.get("source"),
         "数据可用": quote.get("ok", False),
     }
+    if factors:
+        facts["动量与热度"] = {
+            "20日涨幅(%)": round(factors["ret20"], 2) if factors.get("ret20") is not None else None,
+            "60日涨幅(%)": round(factors["ret60"], 2) if factors.get("ret60") is not None else None,
+            "近5日相对前20日放量倍数": round(factors["vol_surge"], 2) if factors.get("vol_surge") is not None else None,
+            "所属板块": stock.get("sector"),
+            "板块热度分位(0~1)": factors.get("sector_score"),
+            "综合动量分位(0~1)": factors.get("mom_score"),
+            "资金关注度分位(0~1)": factors.get("heat_score"),
+            "价值陷阱风险(便宜但动量与板块双弱)": factors.get("value_trap"),
+        }
     if tech:
         facts["技术指标"] = {
             "MACD_DIF": round(tech["dif"], 4), "MACD_DEA": round(tech["dea"], 4),
@@ -436,13 +521,15 @@ def build_messages(stock, quote, date, tech=None):
             "技术信号": tech["signals"],
         }
     user = (
-        "以下是该 A 股标的的实时行情、基本面与技术面指标（仅这些为可引用的事实数据）：\n"
+        "以下是该 A 股标的的实时行情、基本面、技术面与动量/板块热度指标（仅这些为可引用的事实数据）：\n"
         + json.dumps(facts, ensure_ascii=False, indent=2)
-        + "\n\n请据此输出一份精炼的个股研究结论，须同时结合基本面与技术面，严格按如下 JSON 结构返回（键名保持一致）：\n"
+        + "\n\n请据此输出一份精炼的个股研究结论，须综合基本面、技术面与动量/板块热度三方面，"
+        "尤其警惕\"价值陷阱\"（PE/PB 便宜但动量弱、板块遇冷、缺乏催化，往往便宜有便宜的道理）；"
+        "严格按如下 JSON 结构返回（键名保持一致）：\n"
         + JSON_SCHEMA_HINT
         + "\n\n注意：只可引用上面提供的数字；若数据可用=false，请把 valuation_label 设为\"数据不足\"、fair_value_range 设为\"未获取到\"，"
         "并在 reasoning 中说明因缺少实时数据而降级；若无\"技术指标\"字段，technical_comment 填\"未获取到\"。"
-        "dcf_assumptions 仅在你有可辩护的情景假设时给出 dcf.py 兼容对象，否则填 null。"
+        "reasoning 需说明是否存在价值陷阱风险。dcf_assumptions 仅在你有可辩护的情景假设时给出 dcf.py 兼容对象，否则填 null。"
     )
     return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
@@ -573,44 +660,55 @@ def render_markdown(date, results, screen_stats=None):
     lines.append("")
     if screen_stats:
         c = screen_stats["criteria"]
-        lines.append("**先按量化标准筛选，再研究**。硬性入选标准：")
+        lines.append("**先按量化标准多因子打分选股，再逐票研究**。为避免只按 PE/PB 选出\"便宜但没人玩\"的价值陷阱，"
+                     "PE/PB 仅作宽松门槛，真正的排序由\"价值 + 技术 + 动量 + 板块热度 + 资金关注度\"多因子决定。")
         lines.append("")
-        lines.append(f"- 排除 ST/*ST 等退市风险标的：{'是' if c['exclude_st'] else '否'}")
-        lines.append(f"- 盈利且估值不过高：0 < PE(TTM) ≤ {c['pe_max']:.0f}")
-        lines.append(f"- 市净率合理：0 < PB ≤ {c['pb_max']:.0f}")
-        lines.append(f"- 规模与流动性：总市值 ≥ {c['min_total_mktcap_yi']:.0f} 亿元")
-        lines.append(f"- 行情数据可获取（腾讯/新浪）")
+        lines.append("**宽松硬门槛**（仅剔除极端/风险标的，不做价值筛选）：")
+        lines.append(f"- 排除 ST/*ST：{'是' if c['exclude_st'] else '否'}；盈利 0 < PE(TTM) ≤ {c['pe_max']:.0f}；"
+                     f"0 < PB ≤ {c['pb_max']:.0f}；总市值 ≥ {c['min_total_mktcap_yi']:.0f} 亿；行情可获取。")
         lines.append("")
-        tw = c.get("tech_weight", 0.0)
-        lines.append(f"**综合评分 = {1 - tw:.1f}×价值分 + {tw:.1f}×技术分**（降序取前 {len(results)} 只）：")
-        lines.append("")
-        lines.append(f"- **价值分**：对低 PE、低 PB 做全体百分位打分，加权 `{c['pe_weight']:.1f}×低PE + {c['pb_weight']:.1f}×低PB`，越便宜越高。")
-        lines.append("- **技术分**（基于日线，0.35 中性基线上下浮动）：**MACD 底背离**(看多+)/顶背离(看空−)、"
-                     "MACD 金叉(+)/死叉(−)、MACD 红柱(+)、站上 MA20(+)、均线多头 MA20>MA60(+)、RSI 超买(−)/超卖(+)。")
+        wsum = (c["w_value"] + c["w_tech"] + c["w_momentum"] + c["w_sector"] + c["w_heat"]) or 1.0
+        lines.append(f"**综合评分 = 价值×{c['w_value']/wsum:.2f} + 技术×{c['w_tech']/wsum:.2f} + "
+                     f"动量×{c['w_momentum']/wsum:.2f} + 板块热度×{c['w_sector']/wsum:.2f} + "
+                     f"资金关注度×{c['w_heat']/wsum:.2f}**（各因子为通过池内百分位，降序取前 {len(results)}）：")
+        lines.append(f"- **价值**：低 PE、低 PB（`{c['pe_weight']:.1f}×低PE + {c['pb_weight']:.1f}×低PB`）。")
+        lines.append("- **技术**：MACD 底背离/金叉/红柱、站上 MA20、均线多头、RSI（基于日线）。")
+        lines.append("- **动量/相对强度**：20 日与 60 日涨幅（偏重近端）——捕捉市场是否在\"追捧\"。")
+        lines.append("- **板块热度**：同板块 20 日动量中位数的分位——体现市场对该板块的重视程度。")
+        lines.append("- **资金关注度**：换手率 + 近 5 日相对前 20 日放量倍数——体现资金活跃度/关注。")
+        lines.append("- **价值陷阱预警**：便宜（价值分高）但动量与板块双弱者，在表中以 ⚠ 标记并在结论中提示。")
         if c.get("require_bullish"):
-            lines.append("- 已启用 `--require-bullish`：仅保留带看多技术信号（底背离/金叉/站上MA20）的个股。")
+            lines.append("- 已启用 `--require-bullish`：仅保留带看多技术信号的个股。")
         lines.append("")
+        hs = screen_stats.get("hot_sectors", [])
+        if hs:
+            lines.append("**当日板块热度 Top（按 20 日动量中位数）**：" +
+                         "、".join(f"{s} {m:+.1f}%" for s, m in hs[:6]))
+            lines.append("")
         lines.append(f"> 本次：候选池 {screen_stats['n_universe']} 只 → 有效行情 {screen_stats['n_ok']} 只 "
-                     f"→ 通过基本面 {screen_stats['n_passed']} 只（带看多技术信号 {screen_stats.get('n_bullish','-')} 只）"
-                     f"→ 取综合评分前 {len(results)} 只研究。")
+                     f"→ 通过基本面 {screen_stats['n_passed']} 只 → 取综合评分前 {len(results)} 只研究。")
     else:
-        lines.append("> 本次未使用量化筛选（手动指定标的或按日期轮换）；技术指标仍会计算并纳入研究。")
+        lines.append("> 本次未使用量化筛选（手动指定标的或按日期轮换）；技术/动量指标仍会计算并纳入研究。")
     lines.append("")
 
     # 汇总表
     lines.append("## 二、今日组合速览")
     lines.append("")
-    lines.append("| 排名 | 代码 | 名称 | 行业 | 现价(元) | 涨跌幅 | PE(TTM) | PB | 技术信号 | 综合评分 | 估值判断 | 建议动作 | 信心 |")
+    lines.append("| 排名 | 代码 | 名称 | 行业 | 现价(元) | 涨跌幅 | PE(TTM) | PB | 20日涨幅 | 技术信号 | 综合评分 | 建议动作 | 信心 |")
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
         q, a = r["quote"], r["analysis"]
         rank = r.get("rank") if r.get("rank") is not None else "-"
         score = f"{r['score']:.3f}" if r.get("score") is not None else "-"
+        name = q.get("name") or r["stock"].get("name")
+        if r.get("value_trap"):
+            name += " ⚠陷阱"
+        ret20 = _fmt(r.get("ret20"), "%", 1) if r.get("ret20") is not None else "—"
         lines.append(
-            f"| {rank} | {r['code']} | {q.get('name') or r['stock'].get('name')} | {r['stock'].get('sector','-')} "
+            f"| {rank} | {r['code']} | {name} | {r['stock'].get('sector','-')} "
             f"| {_fmt(q.get('price'))} | {_fmt(q.get('change_pct'),'%')} "
-            f"| {_fmt(q.get('pe_ttm'))} | {_fmt(q.get('pb'))} | {_tech_badge(r.get('tech'))} | {score} "
-            f"| {a.get('valuation_label','-')} | **{a.get('action','-')}** | {a.get('confidence','-')} |"
+            f"| {_fmt(q.get('pe_ttm'))} | {_fmt(q.get('pb'))} | {ret20} | {_tech_badge(r.get('tech'))} | {score} "
+            f"| **{a.get('action','-')}** | {a.get('confidence','-')} |"
         )
     lines.append("")
 
@@ -655,6 +753,14 @@ def render_markdown(date, results, screen_stats=None):
                 + (f"（信号：{'、'.join(tech['signals'])}）" if tech["signals"] else ""))
         if a.get("technical_comment") and a.get("technical_comment") not in ("未获取到", "-"):
             lines.append(f"- **技术面解读**：{a.get('technical_comment')}")
+        if r.get("score") is not None:
+            surge = f"{r['vol_surge']:.2f}x" if r.get("vol_surge") is not None else "—"
+            trap = "；**⚠价值陷阱风险（便宜但动量与板块双弱）**" if r.get("value_trap") else ""
+            lines.append(
+                f"- **动量与板块热度**：20日涨幅 {_fmt(r.get('ret20'),'%',1)}、60日涨幅 {_fmt(r.get('ret60'),'%',1)}，"
+                f"近5日放量 {surge}；所属板块「{r['stock'].get('sector','-')}」热度分位 {_fmt(r.get('sector_score'),nd=2)}；"
+                f"因子分位——价值 {_fmt(r.get('value_score'),nd=2)}/技术 {_fmt(r.get('tech_score'),nd=2)}/"
+                f"动量 {_fmt(r.get('mom_score'),nd=2)}/关注 {_fmt(r.get('heat_score'),nd=2)}{trap}")
         lines.append(f"- **估值判断**：{a.get('valuation_label','-')}；合理区间：{a.get('fair_value_range','未获取到')}")
         risks = a.get("key_risks") or []
         cats = a.get("catalysts") or []
@@ -697,8 +803,12 @@ def main():
     ap.add_argument("--min-mktcap", type=float, default=DEFAULT_CRITERIA["min_total_mktcap_yi"],
                     help="总市值下限（亿元）")
     ap.add_argument("--include-st", action="store_true", help="不排除 ST/*ST（默认排除）")
-    ap.add_argument("--tech-weight", type=float, default=DEFAULT_CRITERIA["tech_weight"],
-                    help="综合评分中技术面权重(0~1)，价值面权重=1-该值，默认0.4")
+    # 多因子权重（内部归一化）：价值/技术/动量/板块/关注度
+    ap.add_argument("--w-value", type=float, default=DEFAULT_CRITERIA["w_value"], help="价值因子权重")
+    ap.add_argument("--w-tech", type=float, default=DEFAULT_CRITERIA["w_tech"], help="技术因子权重")
+    ap.add_argument("--w-momentum", type=float, default=DEFAULT_CRITERIA["w_momentum"], help="动量因子权重")
+    ap.add_argument("--w-sector", type=float, default=DEFAULT_CRITERIA["w_sector"], help="板块强度权重")
+    ap.add_argument("--w-heat", type=float, default=DEFAULT_CRITERIA["w_heat"], help="资金关注度权重")
     ap.add_argument("--require-bullish", action="store_true",
                     help="仅保留带看多技术信号(底背离/金叉/站上MA20)的个股")
     args = ap.parse_args()
@@ -717,14 +827,18 @@ def main():
         criteria = dict(DEFAULT_CRITERIA)
         criteria.update({"pe_max": args.pe_max, "pb_max": args.pb_max,
                          "min_total_mktcap_yi": args.min_mktcap, "exclude_st": not args.include_st,
-                         "tech_weight": args.tech_weight, "require_bullish": args.require_bullish})
-        print(f"[筛选] 基本面标准：0<PE≤{criteria['pe_max']}，0<PB≤{criteria['pb_max']}，"
-              f"总市值≥{criteria['min_total_mktcap_yi']}亿，{'排除' if criteria['exclude_st'] else '不排除'}ST；"
-              f"技术面权重 {criteria['tech_weight']}（含MACD/背离/均线/RSI）；正在抓取全池行情与日线…")
+                         "require_bullish": args.require_bullish,
+                         "w_value": args.w_value, "w_tech": args.w_tech, "w_momentum": args.w_momentum,
+                         "w_sector": args.w_sector, "w_heat": args.w_heat})
+        print(f"[筛选] 宽松基本面门槛：0<PE≤{criteria['pe_max']}，0<PB≤{criteria['pb_max']}，"
+              f"总市值≥{criteria['min_total_mktcap_yi']}亿，{'排除' if criteria['exclude_st'] else '不排除'}ST（含高成长股）；"
+              f"多因子权重 价值{args.w_value}/技术{args.w_tech}/动量{args.w_momentum}/板块{args.w_sector}/关注{args.w_heat}；"
+              "正在抓取全池行情与日线…")
         selected, screen_stats = screen_universe(universe, criteria, args.count)
+        hot = "、".join(f"{s}({m:+.1f}%)" for s, m in screen_stats.get("hot_sectors", [])[:5])
         print(f"[筛选] 全池 {screen_stats['n_universe']} 只 → 有效行情 {screen_stats['n_ok']} 只 "
-              f"→ 通过基本面 {screen_stats['n_passed']} 只（其中带看多技术信号 {screen_stats['n_bullish']} 只）"
-              f"→ 取综合评分前 {len(selected)} 只。")
+              f"→ 通过基本面 {screen_stats['n_passed']} 只 → 取综合评分前 {len(selected)} 只。")
+        print(f"[板块热度Top] {hot}")
         if not selected:
             print("[错误] 没有个股通过筛选标准，请放宽 --pe-max/--pb-max/--min-mktcap。", file=sys.stderr)
             sys.exit(2)
@@ -750,12 +864,18 @@ def main():
         code = f"{stock['market'].upper()}{stock['code']}"
         quote = item.get("quote") or fetch_quote(stock)  # 筛选阶段已抓取则复用
         tech = item.get("tech")
-        if tech is None and (args.tickers or args.select == "rotate"):
-            tech = technical_analysis(fetch_kline(code.lower(), DEFAULT_CRITERIA["kline_days"]))
+        if "bars" not in item and (args.tickers or args.select == "rotate"):
+            bars = fetch_kline(code.lower(), DEFAULT_CRITERIA["kline_days"])
+            tech = technical_analysis(bars)
+            item.update({"tech": tech, "ret20": _ret(bars, 20), "ret60": _ret(bars, 60),
+                         "vol_surge": _volume_surge(bars)})
+        factors = {k: item.get(k) for k in ("ret20", "ret60", "vol_surge", "rs",
+                                            "mom_score", "heat_score", "sector_score", "value_trap")}
         print(f"  [{i}/{len(selected)}] {code} {quote.get('name') or ''} "
               f"现价={quote.get('price')} 数据={'OK' if quote.get('ok') else '未获取到'}"
               + (f" 评分={item['score']}" if item.get('score') is not None else "")
-              + (f" 技术={'/'.join(tech['signals'][:2]) or '中性'}" if tech else ""))
+              + (f" 20日={item['ret20']:.1f}%" if item.get('ret20') is not None else "")
+              + (" ⚠陷阱" if item.get('value_trap') else ""))
         if args.no_llm:
             analysis = {
                 "one_liner": "（离线自测占位，未调用LLM）",
@@ -769,7 +889,7 @@ def main():
             usage = {}
         else:
             try:
-                analysis, usage = call_llm(build_messages(stock, quote, date, tech), args.model,
+                analysis, usage = call_llm(build_messages(stock, quote, date, tech, factors), args.model,
                                            api_key, args.max_tokens, args.timeout)
             except Exception as e:  # noqa: BLE001
                 print(f"      LLM失败，降级占位: {e}", file=sys.stderr)
@@ -786,7 +906,10 @@ def main():
         results.append({"stock": stock, "code": code, "quote": quote, "analysis": analysis,
                         "dcf": dcf, "score": item.get("score"), "rank": item.get("rank"),
                         "tech": tech, "value_score": item.get("value_score"),
-                        "tech_score": item.get("tech_score")})
+                        "tech_score": item.get("tech_score"), "mom_score": item.get("mom_score"),
+                        "sector_score": item.get("sector_score"), "heat_score": item.get("heat_score"),
+                        "ret20": item.get("ret20"), "ret60": item.get("ret60"),
+                        "vol_surge": item.get("vol_surge"), "value_trap": item.get("value_trap")})
         time.sleep(0.3)
 
     # 排序：按建议动作（买入优先）

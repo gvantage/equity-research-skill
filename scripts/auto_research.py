@@ -618,31 +618,35 @@ def _extract_json(text):
     raise ValueError("JSON 对象不完整")
 
 
-def call_llm(messages, model, api_key, max_tokens=1500, timeout=90, retries=3):
-    body = json.dumps({
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.3,
-    }).encode()
+def call_llm(messages, model, api_key, max_tokens=1500, timeout=90, retries=4):
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://github.com/gvantage/equity-research-skill",
         "X-Title": "auto-equity-research",
     }
+    use_json_mode = True   # 强制 JSON 输出，规避模型偶发返回散文/空内容
     last_err = None
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(OPENROUTER_URL, data=body, headers=headers)
+            payload = {"model": model, "messages": messages,
+                       "max_tokens": max_tokens, "temperature": 0.3}
+            if use_json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            req = urllib.request.Request(OPENROUTER_URL, data=json.dumps(payload).encode(), headers=headers)
             resp = urllib.request.urlopen(req, timeout=timeout)
             data = json.load(resp)
             msg = data["choices"][0].get("message", {})
             content = msg.get("content") or msg.get("reasoning") or ""  # 某些模型 content 可能为 null
             if not content.strip():
                 raise ValueError("空响应（content 为空，可能因推理占满 token）")
-            usage = data.get("usage", {})
-            return _extract_json(content), usage
+            return _extract_json(content), data.get("usage", {})
+        except urllib.error.HTTPError as e:
+            # 部分模型不支持 response_format，去掉后重试
+            if use_json_mode and e.code in (400, 404, 422):
+                use_json_mode = False
+            last_err = e
+            time.sleep(2 * (attempt + 1))
         except Exception as e:  # noqa: BLE001
             last_err = e
             time.sleep(2 * (attempt + 1))

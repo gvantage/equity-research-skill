@@ -287,6 +287,55 @@ def technical_analysis(bars):
             "price": price, "mom20": mom20, "tech_score": round(score, 4), "signals": signals}
 
 
+# ---------- 热点/题材数据（同花顺强势股题材归因，零鉴权） ----------
+# 灵感来源：gvantage/a-stock-data 数据源手册（同花顺 zx.10jqka.com.cn getharden）。
+# 东财板块/概念接口在本环境被墙(502)，改用同花顺强势股题材归因作为“热点/概念”真实信号。
+THS_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/117.0.0.0 Safari/537.36"
+
+
+def _market_of(code):
+    if code[:1] == "6":
+        return "sh"
+    if code[:1] in ("0", "3"):
+        return "sz"
+    return None  # 北交所 8/4 等跳过
+
+
+def fetch_ths_hot(date):
+    """同花顺当日强势股题材归因。返回 (hot_map, hot_themes)。
+
+    hot_map: { 'sh600xxx': {name, sector(主题首标签), theme(完整题材), zhangfu, ddjl} }
+    hot_themes: [(题材标签, 次数), ...] 按频次降序（=当日市场在炒的热点/概念）。
+    数据源失败则返回 ({}, [])，管线自动降级（不影响其余流程）。
+    """
+    url = (f"http://zx.10jqka.com.cn/event/api/getharden/"
+           f"date/{date}/orderby/date/orderway/desc/charset/GBK/")
+    try:
+        raw = _http_get(url, headers={"User-Agent": THS_UA}, timeout=15)
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return {}, []
+    if data.get("errocode", 0) != 0:
+        return {}, []
+    from collections import Counter
+    hot_map, themes = {}, Counter()
+    for row in data.get("data") or []:
+        code = str(row.get("code", ""))
+        mk = _market_of(code)
+        if not mk:
+            continue
+        reason = row.get("reason", "") or ""
+        tags = [t.strip() for t in reason.split("+") if t.strip()]
+        for t in tags:
+            themes[t] += 1
+        hot_map[f"{mk}{code}"] = {
+            "name": row.get("name"), "sector": (tags[0] if tags else "热点"),
+            "theme": reason, "zhangfu": _to_float(row.get("zhangfu")) or 0.0,
+            "ddjl": _to_float(row.get("ddejingliang")),
+        }
+    return hot_map, themes.most_common(15)
+
+
 # ---------- 选股（基于实时数据的量化筛选） ----------
 
 # 说明：为避免"只按 PE/PB 选出一堆便宜银行股"的价值陷阱，PE/PB 从"硬门槛"降级为
@@ -349,14 +398,16 @@ def _volume_surge(bars):
     return recent / prior if prior else None
 
 
-def screen_universe(universe, criteria, count):
+def screen_universe(universe, criteria, count, hot_map=None):
     """多因子选股：基本面宽松硬筛 → 抓日线算技术/动量/关注度/板块强度 → 加权综合评分取前 count。
 
     因子（均为通过池内的百分位打分，[0,1]）：
       价值(低PE/低PB) · 技术(MACD/背离/均线/RSI) · 动量(20/60日相对强度)
-      · 资金关注度(换手率+放量) · 板块强度(同板块动量中位数)。
+      · 资金关注度(换手率+放量，命中当日同花顺强势股再加成) · 板块强度(同板块动量中位数)。
+    hot_map: 同花顺当日强势股题材归因（{secid: {...}}），用于标注热点题材与关注度加成。
     返回 (selected, stats)。
     """
+    hot_map = hot_map or {}
     rows = [{"stock": stock, "quote": fetch_quote(stock)} for stock in universe]
 
     passed = []
@@ -376,7 +427,7 @@ def screen_universe(universe, criteria, count):
             continue
         passed.append(r)
 
-    # 仅对通过基本面的个股抓日线（省请求），计算技术/动量/放量
+    # 仅对通过基本面的个股抓日线（省请求），计算技术/动量/放量，并标注同花顺热点题材
     for r in passed:
         secid = f"{r['stock']['market']}{r['stock']['code']}"
         bars = fetch_kline(secid, criteria["kline_days"])
@@ -385,9 +436,11 @@ def screen_universe(universe, criteria, count):
         r["ret20"] = _ret(bars, 20)
         r["ret60"] = _ret(bars, 60)
         r["vol_surge"] = _volume_surge(bars)
-        # 相对强度：偏重近端
         parts = [x for x in (r["ret20"], r["ret60"]) if x is not None]
         r["rs"] = (0.6 * (r["ret20"] or 0) + 0.4 * (r["ret60"] or 0)) if parts else None
+        hot = hot_map.get(secid)
+        r["is_hot"] = bool(hot)                       # 是否登上当日同花顺强势股榜
+        r["theme"] = hot.get("theme") if hot else None  # 题材归因（热点/概念）
 
     # 板块强度：同 sector 的 20 日动量中位数 → 板块热度百分位
     from statistics import median
@@ -430,6 +483,8 @@ def screen_universe(universe, criteria, count):
             tech_score = r["tech"]["tech_score"] if r.get("tech") else 0.35
             mom_score = rs_s[i]
             heat_score = 0.5 * turn_s[i] + 0.5 * surge_s[i]
+            if r.get("is_hot"):                        # 命中当日同花顺强势股 → 关注度加成
+                heat_score = min(1.0, heat_score + 0.2)
             sector_score = sector_score_map.get(r["stock"].get("sector", "-"), 0.5)
             r["value_score"] = round(value_score, 4)
             r["tech_score"] = round(tech_score, 4)
@@ -508,6 +563,8 @@ def build_messages(stock, quote, date, tech=None, factors=None):
             "综合动量分位(0~1)": factors.get("mom_score"),
             "资金关注度分位(0~1)": factors.get("heat_score"),
             "价值陷阱风险(便宜但动量与板块双弱)": factors.get("value_trap"),
+            "当日登上同花顺强势股": factors.get("is_hot", False),
+            "题材归因(同花顺,热点/概念)": factors.get("theme"),
         }
     if tech:
         facts["技术指标"] = {
@@ -678,18 +735,26 @@ def render_markdown(date, results, screen_stats=None):
         lines.append("- **技术**：MACD 底背离/金叉/红柱、站上 MA20、均线多头、RSI（基于日线）。")
         lines.append("- **动量/相对强度**：20 日与 60 日涨幅（偏重近端）——捕捉市场是否在\"追捧\"。")
         lines.append("- **板块热度**：同板块 20 日动量中位数的分位——体现市场对该板块的重视程度。")
-        lines.append("- **资金关注度**：换手率 + 近 5 日相对前 20 日放量倍数——体现资金活跃度/关注。")
+        lines.append("- **资金关注度**：换手率 + 近 5 日相对前 20 日放量倍数（命中当日同花顺强势股再加成）——体现资金活跃度/关注。")
         lines.append("- **价值陷阱预警**：便宜（价值分高）但动量与板块双弱者，在表中以 ⚠ 标记并在结论中提示。")
         if c.get("require_bullish"):
             lines.append("- 已启用 `--require-bullish`：仅保留带看多技术信号的个股。")
         lines.append("")
+        ht = screen_stats.get("hot_themes", [])
+        if ht:
+            lines.append("**今日热门题材 Top（同花顺强势股题材归因，源 zx.10jqka.com.cn）**：" +
+                         "、".join(f"{t}×{n}" for t, n in ht[:12]))
+            if screen_stats.get("n_seeded"):
+                lines.append(f"　（已把当日 {screen_stats['n_seeded']} 只热门标的并入候选池；🔥 标记表示该股当日登上强势股榜）")
+            lines.append("")
         hs = screen_stats.get("hot_sectors", [])
         if hs:
             lines.append("**当日板块热度 Top（按 20 日动量中位数）**：" +
                          "、".join(f"{s} {m:+.1f}%" for s, m in hs[:6]))
             lines.append("")
-        lines.append(f"> 本次：候选池 {screen_stats['n_universe']} 只 → 有效行情 {screen_stats['n_ok']} 只 "
-                     f"→ 通过基本面 {screen_stats['n_passed']} 只 → 取综合评分前 {len(results)} 只研究。")
+        lines.append(f"> 本次：候选池 {screen_stats['n_universe']} 只（含热点 {screen_stats.get('n_seeded',0)} 只）→ "
+                     f"有效行情 {screen_stats['n_ok']} 只 → 通过基本面 {screen_stats['n_passed']} 只 "
+                     f"→ 取综合评分前 {len(results)} 只研究。")
     else:
         lines.append("> 本次未使用量化筛选（手动指定标的或按日期轮换）；技术/动量指标仍会计算并纳入研究。")
     lines.append("")
@@ -704,6 +769,8 @@ def render_markdown(date, results, screen_stats=None):
         rank = r.get("rank") if r.get("rank") is not None else "-"
         score = f"{r['score']:.3f}" if r.get("score") is not None else "-"
         name = q.get("name") or r["stock"].get("name")
+        if r.get("is_hot"):
+            name = "\U0001f525" + name
         if r.get("value_trap"):
             name += " ⚠陷阱"
         ret20 = _fmt(r.get("ret20"), "%", 1) if r.get("ret20") is not None else "—"
@@ -756,6 +823,8 @@ def render_markdown(date, results, screen_stats=None):
                 + (f"（信号：{'、'.join(tech['signals'])}）" if tech["signals"] else ""))
         if a.get("technical_comment") and a.get("technical_comment") not in ("未获取到", "-"):
             lines.append(f"- **技术面解读**：{a.get('technical_comment')}")
+        if r.get("is_hot") and r.get("theme"):
+            lines.append(f"- **题材归因（同花顺当日强势股 🔥）**：{r['theme']}")
         if r.get("score") is not None:
             surge = f"{r['vol_surge']:.2f}x" if r.get("vol_surge") is not None else "—"
             trap = "；**⚠价值陷阱风险（便宜但动量与板块双弱）**" if r.get("value_trap") else ""
@@ -814,6 +883,8 @@ def main():
     ap.add_argument("--w-heat", type=float, default=DEFAULT_CRITERIA["w_heat"], help="资金关注度权重")
     ap.add_argument("--require-bullish", action="store_true",
                     help="仅保留带看多技术信号(底背离/金叉/站上MA20)的个股")
+    ap.add_argument("--seed-hot", type=int, default=30,
+                    help="并入当日同花顺强势股(题材热点)的数量，0=关闭")
     args = ap.parse_args()
 
     date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else shanghai_today()
@@ -833,13 +904,32 @@ def main():
                          "require_bullish": args.require_bullish,
                          "w_value": args.w_value, "w_tech": args.w_tech, "w_momentum": args.w_momentum,
                          "w_sector": args.w_sector, "w_heat": args.w_heat})
+        # 同花顺当日强势股题材归因：热点/概念真实信号 + 把当日热门标的并入候选池
+        hot_map, hot_themes, n_seeded = {}, [], 0
+        if args.seed_hot > 0:
+            hot_map, hot_themes = fetch_ths_hot(date.strftime("%Y-%m-%d"))
+            if hot_map:
+                existing = {f"{s['market']}{s['code']}" for s in universe}
+                for secid, info in sorted(hot_map.items(), key=lambda kv: kv[1]["zhangfu"], reverse=True):
+                    if n_seeded >= args.seed_hot:
+                        break
+                    if secid in existing:
+                        continue
+                    universe.append({"market": secid[:2], "code": secid[2:],
+                                     "name": info["name"], "sector": info["sector"]})
+                    n_seeded += 1
+            print(f"[热点] 同花顺当日强势股 {len(hot_map)} 只，题材Top: "
+                  + "、".join(f"{t}×{n}" for t, n in hot_themes[:8]) if hot_themes else "[热点] 同花顺数据不可用，降级")
+            print(f"[热点] 并入候选池 {n_seeded} 只当日热门标的")
         print(f"[筛选] 宽松基本面门槛：0<PE≤{criteria['pe_max']}，0<PB≤{criteria['pb_max']}，"
               f"总市值≥{criteria['min_total_mktcap_yi']}亿，{'排除' if criteria['exclude_st'] else '不排除'}ST（含高成长股）；"
               f"多因子权重 价值{args.w_value}/技术{args.w_tech}/动量{args.w_momentum}/板块{args.w_sector}/关注{args.w_heat}；"
               "正在抓取全池行情与日线…")
-        selected, screen_stats = screen_universe(universe, criteria, args.count)
+        selected, screen_stats = screen_universe(universe, criteria, args.count, hot_map)
+        screen_stats["hot_themes"] = hot_themes
+        screen_stats["n_seeded"] = n_seeded
         hot = "、".join(f"{s}({m:+.1f}%)" for s, m in screen_stats.get("hot_sectors", [])[:5])
-        print(f"[筛选] 全池 {screen_stats['n_universe']} 只 → 有效行情 {screen_stats['n_ok']} 只 "
+        print(f"[筛选] 候选池 {screen_stats['n_universe']} 只（含热点 {n_seeded}）→ 有效行情 {screen_stats['n_ok']} 只 "
               f"→ 通过基本面 {screen_stats['n_passed']} 只 → 取综合评分前 {len(selected)} 只。")
         print(f"[板块热度Top] {hot}")
         if not selected:
@@ -872,12 +962,13 @@ def main():
             tech = technical_analysis(bars)
             item.update({"tech": tech, "ret20": _ret(bars, 20), "ret60": _ret(bars, 60),
                          "vol_surge": _volume_surge(bars)})
-        factors = {k: item.get(k) for k in ("ret20", "ret60", "vol_surge", "rs",
-                                            "mom_score", "heat_score", "sector_score", "value_trap")}
+        factors = {k: item.get(k) for k in ("ret20", "ret60", "vol_surge", "rs", "mom_score",
+                                            "heat_score", "sector_score", "value_trap", "is_hot", "theme")}
         print(f"  [{i}/{len(selected)}] {code} {quote.get('name') or ''} "
               f"现价={quote.get('price')} 数据={'OK' if quote.get('ok') else '未获取到'}"
               + (f" 评分={item['score']}" if item.get('score') is not None else "")
               + (f" 20日={item['ret20']:.1f}%" if item.get('ret20') is not None else "")
+              + ("  \U0001f525" + (item.get("theme") or "热点") if item.get('is_hot') else "")
               + (" ⚠陷阱" if item.get('value_trap') else ""))
         if args.no_llm:
             analysis = {
@@ -912,7 +1003,8 @@ def main():
                         "tech_score": item.get("tech_score"), "mom_score": item.get("mom_score"),
                         "sector_score": item.get("sector_score"), "heat_score": item.get("heat_score"),
                         "ret20": item.get("ret20"), "ret60": item.get("ret60"),
-                        "vol_surge": item.get("vol_surge"), "value_trap": item.get("value_trap")})
+                        "vol_surge": item.get("vol_surge"), "value_trap": item.get("value_trap"),
+                        "is_hot": item.get("is_hot"), "theme": item.get("theme")})
         time.sleep(0.3)
 
     # 排序：按建议动作（买入优先）

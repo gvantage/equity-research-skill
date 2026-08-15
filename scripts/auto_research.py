@@ -6,14 +6,16 @@
   2. 抓取实时行情与基础指标（腾讯行情，失败自动降级到新浪；均失败则标注"未获取到"）。
   3. 用已配置的 LLM（OpenRouter，OpenAI 兼容）按 equity-research 纪律逐票生成中文研究结论。
   4. 可选：对 LLM 给出的情景假设调用 scripts/dcf.py 做 DCF 交叉验证（禁止心算）。
-  5. 汇总为一份中文《A股投资建议》Markdown，标题 auto-equity-research@YYYY-MM-DD。
-  6. 可选：通过 lark-cli 推送到飞书云文档。
+  5. 汇总为一份中文《A股投资建议》Markdown（Notion 友好），标题 auto-equity-research@YYYY-MM-DD。
+
+本脚本只负责“生成报告 Markdown”。发布到 Notion 由 Notion MCP 完成（见 scripts/AUTO_RESEARCH.md）：
+由一个按日触发的 Cursor Cloud Agent 运行本脚本后，把生成的 Markdown 通过 notion-create-pages
+作为子页面写入 Notion 的 equity_research_report 容器页。
 
 用法：
   export OPENROUTER_API_KEY=...            # 必需
   export OPENROUTER_MODEL=...              # 必需（如 anthropic/claude-3.5-sonnet）
   python3 scripts/auto_research.py                 # 生成当日报告到 output/
-  python3 scripts/auto_research.py --publish       # 生成并推送到飞书（需先配置 lark-cli 鉴权）
   python3 scripts/auto_research.py --tickers sh600519,sz000858 --no-llm  # 离线自测（跳过LLM）
 
 免责声明：本脚本产出仅为研究参考，不构成投资建议。
@@ -22,7 +24,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import urllib.request
@@ -292,8 +293,8 @@ def _fmt(v, unit="", nd=2):
 def render_markdown(date, results):
     title = f"auto-equity-research@{date}"
     now = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S %Z")
+    # 注意：不在正文顶部重复页面标题（Notion 页面标题走 page property）。
     lines = []
-    lines.append(f"<title>{title}</title>")
     lines.append(f"# A股每日投研与投资建议 · {date}")
     lines.append("")
     lines.append(f"> 生成时间：{now}　|　样本：当日轮换选取 {len(results)} 只A股　|　"
@@ -367,31 +368,6 @@ def render_markdown(date, results):
     return title, "\n".join(lines)
 
 
-# ---------- 飞书发布 ----------
-
-def publish_feishu(md_path, title, as_identity="user", parent_token=None, dry_run=False):
-    cmd = ["lark-cli", "docs", "+create", "--doc-format", "markdown",
-           "--title", title, "--content", f"@{md_path}", "--as", as_identity, "--format", "json"]
-    if parent_token:
-        cmd += ["--parent-token", parent_token]
-    if dry_run:
-        cmd.append("--dry-run")
-    print(f"[发布] 执行: {' '.join(cmd)}")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except FileNotFoundError:
-        return {"ok": False, "error": "未找到 lark-cli，请先安装：npm install -g @larksuite/cli"}
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    try:
-        parsed = json.loads(out or err)
-    except Exception:  # noqa: BLE001
-        parsed = None
-    if proc.returncode == 0 and (parsed is None or parsed.get("ok")):
-        return {"ok": True, "stdout": out, "data": parsed}
-    return {"ok": False, "returncode": proc.returncode, "stdout": out, "stderr": err, "data": parsed}
-
-
 # ---------- 主流程 ----------
 
 def main():
@@ -405,10 +381,6 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1500)
     ap.add_argument("--timeout", type=int, default=90)
     ap.add_argument("--no-llm", action="store_true", help="跳过LLM（离线自测，产出占位分析）")
-    ap.add_argument("--publish", action="store_true", help="生成后推送到飞书(lark-cli)")
-    ap.add_argument("--as", dest="as_identity", default="user", choices=["user", "bot"])
-    ap.add_argument("--parent-token", help="飞书目标文件夹/知识库节点 token")
-    ap.add_argument("--publish-dry-run", action="store_true", help="发布仅预览请求，不实际创建")
     args = ap.parse_args()
 
     date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else shanghai_today()
@@ -480,17 +452,11 @@ def main():
     print(f"[完成] 报告已生成：{out_path}")
     if total_cost:
         print(f"[信息] LLM 累计成本约 ${total_cost:.4f}")
-
-    if args.publish or args.publish_dry_run:
-        res = publish_feishu(out_path, title, args.as_identity, args.parent_token,
-                             dry_run=args.publish_dry_run)
-        if res.get("ok"):
-            print("[发布] 成功推送到飞书。", json.dumps(res.get("data"), ensure_ascii=False))
-        else:
-            print("[发布] 未成功：", json.dumps(res, ensure_ascii=False), file=sys.stderr)
-            print("[提示] 若为未鉴权，请先运行： lark-cli config init --new  然后  lark-cli auth login --recommend",
-                  file=sys.stderr)
-            sys.exit(3)
+    # 供发布用（由 Notion MCP 读取）：页面标题与内容文件路径。
+    print(f"[NOTION] title={title}")
+    print(f"[NOTION] markdown_file={out_path}")
+    print("[NOTION] 发布方式：由按日触发的 Cloud Agent 用 Notion MCP notion-create-pages，"
+          "parent.page_id=equity_research_report 容器页，properties.title 用上面的 title，content 用该 Markdown 文件正文。")
 
 
 if __name__ == "__main__":

@@ -261,11 +261,12 @@ def technical_analysis(bars):
     price = closes[-1]
     mom20 = (price / closes[-21] - 1) * 100 if len(closes) >= 21 else None
 
+    # 注意：MACD 背离已提升为独立因子(见 screen_universe 的 divergence 因子)，此处技术分不再计入背离，避免重复计分。
     score, signals = 0.35, []   # 0.35 中性基线，牛信号加分、熊信号减分
     if bottom:
-        score += 0.30; signals.append("MACD底背离(看多)")
+        signals.append("MACD底背离(看多)")
     if top:
-        score -= 0.30; signals.append("MACD顶背离(看空)")
+        signals.append("MACD顶背离(看空)")
     if cross == "golden":
         score += 0.20; signals.append("MACD金叉")
     elif cross == "dead":
@@ -351,12 +352,14 @@ DEFAULT_CRITERIA = {
     "pb_weight": 0.4,          # 价值分内部：低 PB 权重
     "kline_days": 120,
     "require_bullish": False,
-    # 多因子权重（内部会归一化到 1）：价值/技术/动量/板块热度/资金关注度
-    "w_value": 0.25,
-    "w_tech": 0.15,
-    "w_momentum": 0.25,
-    "w_sector": 0.20,
-    "w_heat": 0.15,
+    # 多因子权重（内部会归一化到 1）：价值/技术/MACD背离/动量/板块热度/资金关注度
+    # MACD 背离单列为高权重因子：底背离(看多)显著加分、顶背离(看空)显著减分。
+    "w_value": 0.20,
+    "w_tech": 0.12,
+    "w_divergence": 0.16,
+    "w_momentum": 0.22,
+    "w_sector": 0.16,
+    "w_heat": 0.14,
 }
 
 
@@ -466,12 +469,12 @@ def screen_universe(universe, criteria, count, hot_map=None):
                         or (r["tech"]["ma20"] and r["tech"]["price"] > r["tech"]["ma20"]))]
 
     if ranked_pool:
-        # 归一化权重
-        wsum = (criteria["w_value"] + criteria["w_tech"] + criteria["w_momentum"]
-                + criteria["w_sector"] + criteria["w_heat"]) or 1.0
-        wv, wt, wm, ws, wh = (criteria["w_value"] / wsum, criteria["w_tech"] / wsum,
-                              criteria["w_momentum"] / wsum, criteria["w_sector"] / wsum,
-                              criteria["w_heat"] / wsum)
+        # 归一化权重（含 MACD 背离独立因子）
+        wsum = (criteria["w_value"] + criteria["w_tech"] + criteria["w_divergence"]
+                + criteria["w_momentum"] + criteria["w_sector"] + criteria["w_heat"]) or 1.0
+        wv, wt, wd, wm, ws, wh = (criteria["w_value"] / wsum, criteria["w_tech"] / wsum,
+                                  criteria["w_divergence"] / wsum, criteria["w_momentum"] / wsum,
+                                  criteria["w_sector"] / wsum, criteria["w_heat"] / wsum)
         # 各因子池内百分位
         pe_s = _ascending_scores([r["quote"]["pe_ttm"] for r in ranked_pool])
         pb_s = _ascending_scores([r["quote"]["pb"] for r in ranked_pool])
@@ -486,16 +489,20 @@ def screen_universe(universe, criteria, count, hot_map=None):
             if r.get("is_hot"):                        # 命中当日同花顺强势股 → 关注度加成
                 heat_score = min(1.0, heat_score + 0.2)
             sector_score = sector_score_map.get(r["stock"].get("sector", "-"), 0.5)
+            # MACD 背离独立因子：底背离(看多)=1.0，顶背离(看空)=0.0，无=0.5(中性)
+            t = r.get("tech")
+            div_score = 1.0 if (t and t["bottom_div"]) else (0.0 if (t and t["top_div"]) else 0.5)
             r["value_score"] = round(value_score, 4)
             r["tech_score"] = round(tech_score, 4)
+            r["div_score"] = round(div_score, 4)
             r["mom_score"] = round(mom_score, 4)
             r["heat_score"] = round(heat_score, 4)
             r["sector_score"] = round(sector_score, 4)
-            r["score"] = round(wv * value_score + wt * tech_score + wm * mom_score
+            r["score"] = round(wv * value_score + wt * tech_score + wd * div_score + wm * mom_score
                                + ws * sector_score + wh * heat_score, 4)
             # 价值陷阱：便宜(价值分高)但动量与板块双弱
             r["value_trap"] = (value_score >= 0.6 and mom_score <= 0.3 and sector_score <= 0.4)
-            r["reason"] = (f"价值{value_score:.2f}/技术{tech_score:.2f}/动量{mom_score:.2f}"
+            r["reason"] = (f"价值{value_score:.2f}/技术{tech_score:.2f}/背离{div_score:.1f}/动量{mom_score:.2f}"
                            f"/板块{sector_score:.2f}/关注{heat_score:.2f}")
         ranked_pool.sort(key=lambda r: r["score"], reverse=True)
 
@@ -727,12 +734,15 @@ def render_markdown(date, results, screen_stats=None):
         lines.append(f"- 排除 ST/*ST：{'是' if c['exclude_st'] else '否'}；盈利 0 < PE(TTM) ≤ {c['pe_max']:.0f}；"
                      f"0 < PB ≤ {c['pb_max']:.0f}；总市值 ≥ {c['min_total_mktcap_yi']:.0f} 亿；行情可获取。")
         lines.append("")
-        wsum = (c["w_value"] + c["w_tech"] + c["w_momentum"] + c["w_sector"] + c["w_heat"]) or 1.0
+        wd0 = c.get("w_divergence", 0.0)
+        wsum = (c["w_value"] + c["w_tech"] + wd0 + c["w_momentum"] + c["w_sector"] + c["w_heat"]) or 1.0
         lines.append(f"**综合评分 = 价值×{c['w_value']/wsum:.2f} + 技术×{c['w_tech']/wsum:.2f} + "
-                     f"动量×{c['w_momentum']/wsum:.2f} + 板块热度×{c['w_sector']/wsum:.2f} + "
+                     f"**MACD背离×{wd0/wsum:.2f}** + 动量×{c['w_momentum']/wsum:.2f} + 板块热度×{c['w_sector']/wsum:.2f} + "
                      f"资金关注度×{c['w_heat']/wsum:.2f}**（各因子为通过池内百分位，降序取前 {len(results)}）：")
         lines.append(f"- **价值**：低 PE、低 PB（`{c['pe_weight']:.1f}×低PE + {c['pb_weight']:.1f}×低PB`）。")
-        lines.append("- **技术**：MACD 底背离/金叉/红柱、站上 MA20、均线多头、RSI（基于日线）。")
+        lines.append(f"- **MACD 背离（独立高权重因子，权重 {wd0/wsum:.0%}）**：**底背离(看多)=满分、顶背离(看空)=零分、无背离=中性**——"
+                     "价创新低而 MACD(DIF) 抬高=底背离；价创新高而 MACD 走低=顶背离。")
+        lines.append("- **技术（其余）**：MACD 金叉/红柱、站上 MA20、均线多头、RSI（基于日线）。")
         lines.append("- **动量/相对强度**：20 日与 60 日涨幅（偏重近端）——捕捉市场是否在\"追捧\"。")
         lines.append("- **板块热度**：同板块 20 日动量中位数的分位——体现市场对该板块的重视程度。")
         lines.append("- **资金关注度**：换手率 + 近 5 日相对前 20 日放量倍数（命中当日同花顺强势股再加成）——体现资金活跃度/关注。")
@@ -762,8 +772,8 @@ def render_markdown(date, results, screen_stats=None):
     # 汇总表
     lines.append("## 二、今日组合速览")
     lines.append("")
-    lines.append("| 排名 | 代码 | 名称 | 行业 | 现价(元) | 涨跌幅 | PE(TTM) | PB | 20日涨幅 | 技术信号 | 综合评分 | 建议动作 | 信心 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| 排名 | 代码 | 名称 | 行业 | 现价(元) | 涨跌幅 | PE(TTM) | PB | 20日涨幅 | MACD背离 | 技术信号 | 综合评分 | 建议动作 | 信心 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
         q, a = r["quote"], r["analysis"]
         rank = r.get("rank") if r.get("rank") is not None else "-"
@@ -774,10 +784,12 @@ def render_markdown(date, results, screen_stats=None):
         if r.get("value_trap"):
             name += " ⚠陷阱"
         ret20 = _fmt(r.get("ret20"), "%", 1) if r.get("ret20") is not None else "—"
+        t = r.get("tech")
+        div = "底背离▲看多" if (t and t["bottom_div"]) else ("顶背离▼看空" if (t and t["top_div"]) else "—")
         lines.append(
             f"| {rank} | {r['code']} | {name} | {r['stock'].get('sector','-')} "
             f"| {_fmt(q.get('price'))} | {_fmt(q.get('change_pct'),'%')} "
-            f"| {_fmt(q.get('pe_ttm'))} | {_fmt(q.get('pb'))} | {ret20} | {_tech_badge(r.get('tech'))} | {score} "
+            f"| {_fmt(q.get('pe_ttm'))} | {_fmt(q.get('pb'))} | {ret20} | {div} | {_tech_badge(r.get('tech'))} | {score} "
             f"| **{a.get('action','-')}** | {a.get('confidence','-')} |"
         )
     lines.append("")
@@ -832,7 +844,7 @@ def render_markdown(date, results, screen_stats=None):
                 f"- **动量与板块热度**：20日涨幅 {_fmt(r.get('ret20'),'%',1)}、60日涨幅 {_fmt(r.get('ret60'),'%',1)}，"
                 f"近5日放量 {surge}；所属板块「{r['stock'].get('sector','-')}」热度分位 {_fmt(r.get('sector_score'),nd=2)}；"
                 f"因子分位——价值 {_fmt(r.get('value_score'),nd=2)}/技术 {_fmt(r.get('tech_score'),nd=2)}/"
-                f"动量 {_fmt(r.get('mom_score'),nd=2)}/关注 {_fmt(r.get('heat_score'),nd=2)}{trap}")
+                f"MACD背离 {_fmt(r.get('div_score'),nd=1)}/动量 {_fmt(r.get('mom_score'),nd=2)}/关注 {_fmt(r.get('heat_score'),nd=2)}{trap}")
         lines.append(f"- **估值判断**：{a.get('valuation_label','-')}；合理区间：{a.get('fair_value_range','未获取到')}")
         risks = a.get("key_risks") or []
         cats = a.get("catalysts") or []
@@ -878,6 +890,7 @@ def main():
     # 多因子权重（内部归一化）：价值/技术/动量/板块/关注度
     ap.add_argument("--w-value", type=float, default=DEFAULT_CRITERIA["w_value"], help="价值因子权重")
     ap.add_argument("--w-tech", type=float, default=DEFAULT_CRITERIA["w_tech"], help="技术因子权重")
+    ap.add_argument("--w-div", type=float, default=DEFAULT_CRITERIA["w_divergence"], help="MACD背离因子权重")
     ap.add_argument("--w-momentum", type=float, default=DEFAULT_CRITERIA["w_momentum"], help="动量因子权重")
     ap.add_argument("--w-sector", type=float, default=DEFAULT_CRITERIA["w_sector"], help="板块强度权重")
     ap.add_argument("--w-heat", type=float, default=DEFAULT_CRITERIA["w_heat"], help="资金关注度权重")
@@ -902,8 +915,8 @@ def main():
         criteria.update({"pe_max": args.pe_max, "pb_max": args.pb_max,
                          "min_total_mktcap_yi": args.min_mktcap, "exclude_st": not args.include_st,
                          "require_bullish": args.require_bullish,
-                         "w_value": args.w_value, "w_tech": args.w_tech, "w_momentum": args.w_momentum,
-                         "w_sector": args.w_sector, "w_heat": args.w_heat})
+                         "w_value": args.w_value, "w_tech": args.w_tech, "w_divergence": args.w_div,
+                         "w_momentum": args.w_momentum, "w_sector": args.w_sector, "w_heat": args.w_heat})
         # 同花顺当日强势股题材归因：热点/概念真实信号 + 把当日热门标的并入候选池
         hot_map, hot_themes, n_seeded = {}, [], 0
         if args.seed_hot > 0:
@@ -923,7 +936,7 @@ def main():
             print(f"[热点] 并入候选池 {n_seeded} 只当日热门标的")
         print(f"[筛选] 宽松基本面门槛：0<PE≤{criteria['pe_max']}，0<PB≤{criteria['pb_max']}，"
               f"总市值≥{criteria['min_total_mktcap_yi']}亿，{'排除' if criteria['exclude_st'] else '不排除'}ST（含高成长股）；"
-              f"多因子权重 价值{args.w_value}/技术{args.w_tech}/动量{args.w_momentum}/板块{args.w_sector}/关注{args.w_heat}；"
+              f"多因子权重 价值{args.w_value}/技术{args.w_tech}/背离{args.w_div}/动量{args.w_momentum}/板块{args.w_sector}/关注{args.w_heat}；"
               "正在抓取全池行情与日线…")
         selected, screen_stats = screen_universe(universe, criteria, args.count, hot_map)
         screen_stats["hot_themes"] = hot_themes
@@ -963,7 +976,8 @@ def main():
             item.update({"tech": tech, "ret20": _ret(bars, 20), "ret60": _ret(bars, 60),
                          "vol_surge": _volume_surge(bars)})
         factors = {k: item.get(k) for k in ("ret20", "ret60", "vol_surge", "rs", "mom_score",
-                                            "heat_score", "sector_score", "value_trap", "is_hot", "theme")}
+                                            "heat_score", "sector_score", "div_score", "value_trap",
+                                            "is_hot", "theme")}
         print(f"  [{i}/{len(selected)}] {code} {quote.get('name') or ''} "
               f"现价={quote.get('price')} 数据={'OK' if quote.get('ok') else '未获取到'}"
               + (f" 评分={item['score']}" if item.get('score') is not None else "")
@@ -1004,7 +1018,8 @@ def main():
                         "sector_score": item.get("sector_score"), "heat_score": item.get("heat_score"),
                         "ret20": item.get("ret20"), "ret60": item.get("ret60"),
                         "vol_surge": item.get("vol_surge"), "value_trap": item.get("value_trap"),
-                        "is_hot": item.get("is_hot"), "theme": item.get("theme")})
+                        "is_hot": item.get("is_hot"), "theme": item.get("theme"),
+                        "div_score": item.get("div_score")})
         time.sleep(0.3)
 
     # 排序：按建议动作（买入优先）

@@ -401,6 +401,81 @@ def _volume_surge(bars):
     return recent / prior if prior else None
 
 
+SINA_NODE_URL = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                 "Market_Center.getHQNodeData")
+
+
+def load_sector_map(path):
+    """由本地股票池构造 代码→行业 映射（用于给全市场标的补行业标签）。"""
+    try:
+        return {f"{s['market']}{s['code']}": s.get("sector", "其他") for s in load_universe(path)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def fetch_market_universe(min_mktcap_yi, pe_max, pb_max, exclude_st, max_pages=40):
+    """全市场候选池：新浪 hs_a（全部A股）按总市值降序分页，市值跌破下限即停；
+    并按 0<PE≤pe_max、0<PB≤pb_max、非ST、沪深(排除北交所)过滤。
+    返回 (pool, scanned)；失败/空则 ([],0)，调用方降级到本地股票池。
+    字段：market/code/name/pe/pb/mktcap_yi/turnover/changepct（均来自新浪批量行情，无需逐票请求）。
+    """
+    pool, scanned = [], 0
+    for p in range(1, max_pages + 1):
+        url = f"{SINA_NODE_URL}?page={p}&num=100&sort=mktcap&asc=0&node=hs_a"
+        try:
+            raw = _http_get(url, headers={"User-Agent": UA}, timeout=20)
+            rows = json.loads(raw.decode("utf-8", "replace") or "[]")
+        except Exception:  # noqa: BLE001
+            break
+        if not rows:
+            break
+        below = False
+        for r in rows:
+            scanned += 1
+            try:
+                mc = float(r.get("mktcap") or 0) / 10000.0   # 万元→亿元
+            except (TypeError, ValueError):
+                mc = 0.0
+            if mc < min_mktcap_yi:      # 已按市值降序，跌破下限则后续都不合格
+                below = True
+                break
+            sym = str(r.get("symbol", ""))
+            if sym[:2] not in ("sh", "sz"):   # 排除北交所 bj
+                continue
+            name = r.get("name", "") or ""
+            if exclude_st and "ST" in name.upper():
+                continue
+            pe, pb = _to_float(r.get("per")), _to_float(r.get("pb"))
+            if pe is None or not (0 < pe <= pe_max):
+                continue
+            if pb is None or not (0 < pb <= pb_max):
+                continue
+            pool.append({"market": sym[:2], "code": sym[2:], "name": name, "pe": pe, "pb": pb,
+                         "mktcap_yi": round(mc, 2), "turnover": _to_float(r.get("turnoverratio")),
+                         "changepct": _to_float(r.get("changepercent"))})
+        if below:
+            break
+        time.sleep(0.1)
+    return pool, scanned
+
+
+def preselect_shortlist(pool, n, sector_map):
+    """全市场基本面池 → 用可批量获取的字段做初筛打分，取前 n 进入深度(日线)打分。
+    初筛分 = 0.45×低估值(低PE/低PB) + 0.35×高换手(关注) + 0.20×今日涨幅。
+    """
+    if not pool:
+        return []
+    pe_s = _ascending_scores([x["pe"] for x in pool])
+    pb_s = _ascending_scores([x["pb"] for x in pool])
+    turn_s = _descending_scores([x.get("turnover") for x in pool])
+    chg_s = _descending_scores([x.get("changepct") for x in pool])
+    for i, x in enumerate(pool):
+        x["_pre"] = 0.45 * (0.6 * pe_s[i] + 0.4 * pb_s[i]) + 0.35 * turn_s[i] + 0.20 * chg_s[i]
+    top = sorted(pool, key=lambda x: x["_pre"], reverse=True)[:n]
+    return [{"market": x["market"], "code": x["code"], "name": x["name"],
+             "sector": sector_map.get(f"{x['market']}{x['code']}", "其他")} for x in top]
+
+
 def screen_universe(universe, criteria, count, hot_map=None):
     """多因子选股：基本面宽松硬筛 → 抓日线算技术/动量/关注度/板块强度 → 加权综合评分取前 count。
 
@@ -731,8 +806,10 @@ def render_markdown(date, results, screen_stats=None):
     lines.append("")
     if screen_stats:
         c = screen_stats["criteria"]
-        lines.append("**先按量化标准多因子打分选股，再逐票研究**。为避免只按 PE/PB 选出\"便宜但没人玩\"的价值陷阱，"
-                     "PE/PB 仅作宽松门槛，真正的排序由\"价值 + 技术 + 动量 + 板块热度 + 资金关注度\"多因子决定。")
+        scope = "全市场（新浪 hs_a 全部A股，5000+ 只）两阶段漏斗" if screen_stats.get("market_scanned") else "候选股票池"
+        lines.append(f"**覆盖{scope}：先量化多因子打分选股，再逐票研究**。第一阶段用可批量获取的基本面(PE/PB/市值/换手/今日涨幅)"
+                     "在全市场初筛入围；第二阶段对入围股抓日线做技术/背离/动量/板块热度深度打分。"
+                     "为避免\"便宜但没人玩\"的价值陷阱，PE/PB 仅作宽松门槛，排序由多因子共同决定。")
         lines.append("")
         lines.append("**宽松硬门槛**（仅剔除极端/风险标的，不做价值筛选）：")
         lines.append(f"- 排除 ST/*ST：{'是' if c['exclude_st'] else '否'}；盈利 0 < PE(TTM) ≤ {c['pe_max']:.0f}；"
@@ -766,9 +843,15 @@ def render_markdown(date, results, screen_stats=None):
             lines.append("**当日板块热度 Top（按 20 日动量中位数）**：" +
                          "、".join(f"{s} {m:+.1f}%" for s, m in hs[:6]))
             lines.append("")
-        lines.append(f"> 本次：候选池 {screen_stats['n_universe']} 只（含热点 {screen_stats.get('n_seeded',0)} 只）→ "
-                     f"有效行情 {screen_stats['n_ok']} 只 → 通过基本面 {screen_stats['n_passed']} 只 "
-                     f"→ 取综合评分前 {len(results)} 只研究。")
+        if screen_stats.get("market_scanned"):
+            lines.append(f"> 本次（全市场两阶段漏斗）：新浪全市场扫描 {screen_stats['market_scanned']} 只 → "
+                         f"基本面通过 {screen_stats['market_qualified']} 只 → 初筛入围 "
+                         f"{screen_stats['n_universe'] - screen_stats.get('n_seeded',0)} 只（+热点 {screen_stats.get('n_seeded',0)} 只）→ "
+                         f"深度打分 {screen_stats['n_passed']} 只 → 取前 {len(results)} 只研究。")
+        else:
+            lines.append(f"> 本次：候选池 {screen_stats['n_universe']} 只（含热点 {screen_stats.get('n_seeded',0)} 只）→ "
+                         f"有效行情 {screen_stats['n_ok']} 只 → 通过基本面 {screen_stats['n_passed']} 只 "
+                         f"→ 取综合评分前 {len(results)} 只研究。")
     else:
         lines.append("> 本次未使用量化筛选（手动指定标的或按日期轮换）；技术/动量指标仍会计算并纳入研究。")
     lines.append("")
@@ -902,6 +985,10 @@ def main():
                     help="仅保留带看多技术信号(底背离/金叉/站上MA20)的个股")
     ap.add_argument("--seed-hot", type=int, default=30,
                     help="并入当日同花顺强势股(题材热点)的数量，0=关闭")
+    ap.add_argument("--universe-source", choices=["market", "file"], default="market",
+                    help="候选池来源：market=新浪全市场初筛(默认)，file=本地股票池")
+    ap.add_argument("--shortlist", type=int, default=80,
+                    help="全市场基本面初筛后进入深度(日线)打分的入围数量，默认80")
     args = ap.parse_args()
 
     date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else shanghai_today()
@@ -914,13 +1001,28 @@ def main():
             t = t.strip().lower()
             selected.append({"stock": {"market": t[:2], "code": t[2:], "name": None, "sector": "-"}})
     elif args.select == "screen":
-        universe = load_universe(args.universe)
         criteria = dict(DEFAULT_CRITERIA)
         criteria.update({"pe_max": args.pe_max, "pb_max": args.pb_max,
                          "min_total_mktcap_yi": args.min_mktcap, "exclude_st": not args.include_st,
                          "require_bullish": args.require_bullish,
                          "w_value": args.w_value, "w_tech": args.w_tech, "w_divergence": args.w_div,
                          "w_momentum": args.w_momentum, "w_sector": args.w_sector, "w_heat": args.w_heat})
+        # 第一阶段：全市场基本面初筛（新浪 hs_a 全部A股，无需逐票请求）→ 入围 shortlist
+        sector_map = load_sector_map(args.universe)
+        market_scanned = market_qualified = 0
+        if args.universe_source == "market":
+            print("[全市场] 正在从新浪全市场(hs_a)按市值降序拉取并做基本面初筛…")
+            market_pool, market_scanned = fetch_market_universe(
+                criteria["min_total_mktcap_yi"], criteria["pe_max"], criteria["pb_max"], criteria["exclude_st"])
+            if market_pool:
+                market_qualified = len(market_pool)
+                universe = preselect_shortlist(market_pool, args.shortlist, sector_map)
+                print(f"[全市场] 扫描 {market_scanned} 只 → 基本面通过 {market_qualified} 只 → 初筛入围 {len(universe)} 只")
+            else:
+                universe = load_universe(args.universe)
+                print("[全市场] 新浪全市场不可用，降级到本地股票池")
+        else:
+            universe = load_universe(args.universe)
         # 同花顺当日强势股题材归因：热点/概念真实信号 + 把当日热门标的并入候选池
         hot_map, hot_themes, n_seeded = {}, [], 0
         if args.seed_hot > 0:
@@ -945,6 +1047,8 @@ def main():
         selected, screen_stats = screen_universe(universe, criteria, args.count, hot_map)
         screen_stats["hot_themes"] = hot_themes
         screen_stats["n_seeded"] = n_seeded
+        screen_stats["market_scanned"] = market_scanned
+        screen_stats["market_qualified"] = market_qualified
         hot = "、".join(f"{s}({m:+.1f}%)" for s, m in screen_stats.get("hot_sectors", [])[:5])
         print(f"[筛选] 候选池 {screen_stats['n_universe']} 只（含热点 {n_seeded}）→ 有效行情 {screen_stats['n_ok']} 只 "
               f"→ 通过基本面 {screen_stats['n_passed']} 只 → 取综合评分前 {len(selected)} 只。")

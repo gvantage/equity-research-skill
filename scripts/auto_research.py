@@ -573,7 +573,10 @@ def call_llm(messages, model, api_key, max_tokens=1500, timeout=90, retries=3):
             req = urllib.request.Request(OPENROUTER_URL, data=body, headers=headers)
             resp = urllib.request.urlopen(req, timeout=timeout)
             data = json.load(resp)
-            content = data["choices"][0]["message"]["content"]
+            msg = data["choices"][0].get("message", {})
+            content = msg.get("content") or msg.get("reasoning") or ""  # 某些模型 content 可能为 null
+            if not content.strip():
+                raise ValueError("空响应（content 为空，可能因推理占满 token）")
             usage = data.get("usage", {})
             return _extract_json(content), usage
         except Exception as e:  # noqa: BLE001
@@ -794,7 +797,7 @@ def main():
     ap.add_argument("--universe", default=DEFAULT_UNIVERSE, help="股票池 JSON 路径")
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR, help="输出目录")
     ap.add_argument("--model", default=os.environ.get("OPENROUTER_MODEL"), help="LLM 模型")
-    ap.add_argument("--max-tokens", type=int, default=1500)
+    ap.add_argument("--max-tokens", type=int, default=2200)
     ap.add_argument("--timeout", type=int, default=90)
     ap.add_argument("--no-llm", action="store_true", help="跳过LLM（离线自测，产出占位分析）")
     # 筛选标准（--select screen 时生效）

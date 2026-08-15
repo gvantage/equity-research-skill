@@ -2,7 +2,9 @@
 """auto_research · A股每日自动投研管线
 
 流程：
-  1. 从股票池中按日期确定性轮换选出 N 只 A 股（默认 10 只）。
+  1. 先按量化标准从股票池中筛选并排序，选出 N 只 A 股（默认 10 只）：
+     抓取全池实时行情 → 硬性标准过滤（排除ST、0<PE≤上限、0<PB≤上限、总市值≥下限）
+     → 按“低PE+低PB”综合评分排序 → 取评分前 N 只。（也支持 --select rotate 按日期轮换、--tickers 手动指定）
   2. 抓取实时行情与基础指标（腾讯行情，失败自动降级到新浪；均失败则标注"未获取到"）。
   3. 用已配置的 LLM（OpenRouter，OpenAI 兼容）按 equity-research 纪律逐票生成中文研究结论。
   4. 可选：对 LLM 给出的情景假设调用 scripts/dcf.py 做 DCF 交叉验证（禁止心算）。
@@ -145,6 +147,75 @@ def fetch_quote(stock):
         except Exception:
             continue
     return {"ok": False, "source": "未获取到", "name": stock.get("name")}
+
+
+# ---------- 选股（基于实时数据的量化筛选） ----------
+
+DEFAULT_CRITERIA = {
+    "pe_min": 0.0,              # PE(TTM) 必须为正（盈利）
+    "pe_max": 40.0,            # PE 上限（估值不过高）
+    "pb_min": 0.0,             # PB 必须为正
+    "pb_max": 10.0,            # PB 上限
+    "min_total_mktcap_yi": 300.0,  # 总市值下限（亿元），保证流动性与稳健性
+    "exclude_st": True,        # 排除 ST/*ST（退市风险）
+    "pe_weight": 0.6,          # 综合评分中低 PE 的权重
+    "pb_weight": 0.4,          # 综合评分中低 PB 的权重
+}
+
+
+def _ascending_scores(values):
+    """越小越好：返回每个值的 [0,1] 得分（最小值=1.0，最大值=0.0）。"""
+    n = len(values)
+    order = sorted(range(n), key=lambda i: values[i])
+    scores = [0.0] * n
+    for rank, i in enumerate(order):
+        scores[i] = 1.0 - (rank / (n - 1) if n > 1 else 0.0)
+    return scores
+
+
+def screen_universe(universe, criteria, count):
+    """先抓全池实时行情，按硬性标准过滤，再按低PE/低PB综合评分排序，取前 count 只。
+
+    返回 (selected, stats)：
+      selected：入选个股列表，每项含 stock/quote/score/rank/reason，且已附带实时行情；
+      stats：{"n_universe","n_ok","n_passed","criteria"}，供报告展示。
+    """
+    rows = []
+    for stock in universe:
+        rows.append({"stock": stock, "quote": fetch_quote(stock)})
+
+    passed = []
+    for r in rows:
+        q = r["quote"]
+        if not q.get("ok"):
+            continue
+        name = (q.get("name") or r["stock"].get("name") or "").upper()
+        if criteria["exclude_st"] and "ST" in name:
+            continue
+        pe, pb, mc = q.get("pe_ttm"), q.get("pb"), q.get("total_mktcap_yi")
+        if pe is None or not (criteria["pe_min"] < pe <= criteria["pe_max"]):
+            continue
+        if pb is None or not (criteria["pb_min"] < pb <= criteria["pb_max"]):
+            continue
+        if mc is None or mc < criteria["min_total_mktcap_yi"]:
+            continue
+        passed.append(r)
+
+    if passed:
+        pe_scores = _ascending_scores([r["quote"]["pe_ttm"] for r in passed])
+        pb_scores = _ascending_scores([r["quote"]["pb"] for r in passed])
+        for i, r in enumerate(passed):
+            r["score"] = round(criteria["pe_weight"] * pe_scores[i]
+                               + criteria["pb_weight"] * pb_scores[i], 4)
+            r["reason"] = f"低PE({r['quote']['pe_ttm']:.1f})+低PB({r['quote']['pb']:.2f})"
+        passed.sort(key=lambda r: r["score"], reverse=True)
+
+    selected = passed[:count]
+    for rank, r in enumerate(selected, 1):
+        r["rank"] = rank
+    n_ok = sum(1 for r in rows if r["quote"].get("ok"))
+    stats = {"n_universe": len(rows), "n_ok": n_ok, "n_passed": len(passed), "criteria": criteria}
+    return selected, stats
 
 
 # ---------- LLM 调用 ----------
@@ -290,31 +361,56 @@ def _fmt(v, unit="", nd=2):
     return f"{v}{unit}"
 
 
-def render_markdown(date, results):
+def render_markdown(date, results, screen_stats=None):
     title = f"auto-equity-research@{date}"
     now = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S %Z")
+    sample_desc = ("量化筛选后取评分前 " if screen_stats else "选取 ") + f"{len(results)} 只A股"
     # 注意：不在正文顶部重复页面标题（Notion 页面标题走 page property）。
     lines = []
     lines.append(f"# A股每日投研与投资建议 · {date}")
     lines.append("")
-    lines.append(f"> 生成时间：{now}　|　样本：当日轮换选取 {len(results)} 只A股　|　"
+    lines.append(f"> 生成时间：{now}　|　样本：{sample_desc}　|　"
                  "数据源：腾讯/新浪实时行情，估值判断由已配置LLM生成")
     lines.append("")
     lines.append("> **免责声明**：本报告由自动化管线生成，仅为研究参考，**不构成投资建议**；"
                  "定量数据以行情源为准，定性判断可能存在模型误差，请自行核实并独立决策。")
     lines.append("")
 
-    # 汇总表
-    lines.append("## 一、今日组合速览")
+    # 选股标准与筛选
+    lines.append("## 一、选股标准与筛选")
     lines.append("")
-    lines.append("| 代码 | 名称 | 行业 | 现价(元) | 涨跌幅 | PE(TTM) | PB | 估值判断 | 建议动作 | 信心 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    if screen_stats:
+        c = screen_stats["criteria"]
+        lines.append("**先按量化标准筛选，再研究**。硬性入选标准：")
+        lines.append("")
+        lines.append(f"- 排除 ST/*ST 等退市风险标的：{'是' if c['exclude_st'] else '否'}")
+        lines.append(f"- 盈利且估值不过高：0 < PE(TTM) ≤ {c['pe_max']:.0f}")
+        lines.append(f"- 市净率合理：0 < PB ≤ {c['pb_max']:.0f}")
+        lines.append(f"- 规模与流动性：总市值 ≥ {c['min_total_mktcap_yi']:.0f} 亿元")
+        lines.append(f"- 行情数据可获取（腾讯/新浪）")
+        lines.append("")
+        lines.append(f"**综合评分**（用于在通过标准者中排序）：对低 PE、低 PB 分别做全体百分位打分，"
+                     f"加权 `{c['pe_weight']:.1f}×低PE + {c['pb_weight']:.1f}×低PB`，越便宜得分越高。")
+        lines.append("")
+        lines.append(f"> 本次：候选池 {screen_stats['n_universe']} 只 → 有效行情 {screen_stats['n_ok']} 只 "
+                     f"→ 通过标准 {screen_stats['n_passed']} 只 → 取评分前 {len(results)} 只研究。")
+    else:
+        lines.append("> 本次未使用量化筛选（手动指定标的或按日期轮换）。")
+    lines.append("")
+
+    # 汇总表
+    lines.append("## 二、今日组合速览")
+    lines.append("")
+    lines.append("| 排名 | 代码 | 名称 | 行业 | 现价(元) | 涨跌幅 | PE(TTM) | PB | 综合评分 | 估值判断 | 建议动作 | 信心 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
         q, a = r["quote"], r["analysis"]
+        rank = r.get("rank") if r.get("rank") is not None else "-"
+        score = f"{r['score']:.3f}" if r.get("score") is not None else "-"
         lines.append(
-            f"| {r['code']} | {q.get('name') or r['stock'].get('name')} | {r['stock'].get('sector','-')} "
+            f"| {rank} | {r['code']} | {q.get('name') or r['stock'].get('name')} | {r['stock'].get('sector','-')} "
             f"| {_fmt(q.get('price'))} | {_fmt(q.get('change_pct'),'%')} "
-            f"| {_fmt(q.get('pe_ttm'))} | {_fmt(q.get('pb'))} "
+            f"| {_fmt(q.get('pe_ttm'))} | {_fmt(q.get('pb'))} | {score} "
             f"| {a.get('valuation_label','-')} | **{a.get('action','-')}** | {a.get('confidence','-')} |"
         )
     lines.append("")
@@ -322,7 +418,7 @@ def render_markdown(date, results):
     # 组合层面建议
     buy = [r for r in results if r["analysis"].get("action") in ("买入", "增持")]
     avoid = [r for r in results if r["analysis"].get("action") in ("减持", "回避")]
-    lines.append("## 二、A股投资建议总结")
+    lines.append("## 三、A股投资建议总结")
     lines.append("")
     if buy:
         names = "、".join(f"{r['quote'].get('name') or r['code']}({r['code']})" for r in buy)
@@ -335,7 +431,7 @@ def render_markdown(date, results):
     lines.append("")
 
     # 个股详情
-    lines.append("## 三、个股研究详情")
+    lines.append("## 四、个股研究详情")
     lines.append("")
     for idx, r in enumerate(results, 1):
         q, a = r["quote"], r["analysis"]
@@ -375,25 +471,48 @@ def main():
     ap.add_argument("--date", help="报告日期 YYYY-MM-DD，默认今日(Asia/Shanghai)")
     ap.add_argument("--count", type=int, default=10, help="选股数量，默认10")
     ap.add_argument("--tickers", help="覆盖选股，逗号分隔，如 sh600519,sz000858")
+    ap.add_argument("--select", choices=["screen", "rotate"], default="screen",
+                    help="选股方式：screen=按实时数据量化筛选(默认)，rotate=按日期轮换")
     ap.add_argument("--universe", default=DEFAULT_UNIVERSE, help="股票池 JSON 路径")
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR, help="输出目录")
     ap.add_argument("--model", default=os.environ.get("OPENROUTER_MODEL"), help="LLM 模型")
     ap.add_argument("--max-tokens", type=int, default=1500)
     ap.add_argument("--timeout", type=int, default=90)
     ap.add_argument("--no-llm", action="store_true", help="跳过LLM（离线自测，产出占位分析）")
+    # 筛选标准（--select screen 时生效）
+    ap.add_argument("--pe-max", type=float, default=DEFAULT_CRITERIA["pe_max"], help="PE(TTM) 上限")
+    ap.add_argument("--pb-max", type=float, default=DEFAULT_CRITERIA["pb_max"], help="PB 上限")
+    ap.add_argument("--min-mktcap", type=float, default=DEFAULT_CRITERIA["min_total_mktcap_yi"],
+                    help="总市值下限（亿元）")
+    ap.add_argument("--include-st", action="store_true", help="不排除 ST/*ST（默认排除）")
     args = ap.parse_args()
 
     date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else shanghai_today()
 
     # 选股
+    screen_stats = None
     if args.tickers:
         selected = []
         for t in args.tickers.split(","):
             t = t.strip().lower()
-            selected.append({"market": t[:2], "code": t[2:], "name": None, "sector": "-"})
+            selected.append({"stock": {"market": t[:2], "code": t[2:], "name": None, "sector": "-"}})
+    elif args.select == "screen":
+        universe = load_universe(args.universe)
+        criteria = dict(DEFAULT_CRITERIA)
+        criteria.update({"pe_max": args.pe_max, "pb_max": args.pb_max,
+                         "min_total_mktcap_yi": args.min_mktcap, "exclude_st": not args.include_st})
+        print(f"[筛选] 标准：0<PE≤{criteria['pe_max']}，0<PB≤{criteria['pb_max']}，"
+              f"总市值≥{criteria['min_total_mktcap_yi']}亿，"
+              f"{'排除' if criteria['exclude_st'] else '不排除'}ST；正在抓取全池行情…")
+        selected, screen_stats = screen_universe(universe, criteria, args.count)
+        print(f"[筛选] 全池 {screen_stats['n_universe']} 只，有效行情 {screen_stats['n_ok']} 只，"
+              f"通过标准 {screen_stats['n_passed']} 只，取评分前 {len(selected)} 只。")
+        if not selected:
+            print("[错误] 没有个股通过筛选标准，请放宽 --pe-max/--pb-max/--min-mktcap。", file=sys.stderr)
+            sys.exit(2)
     else:
         universe = load_universe(args.universe)
-        selected = select_tickers(universe, date, args.count)
+        selected = [{"stock": s} for s in select_tickers(universe, date, args.count)]
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not args.no_llm and not api_key:
@@ -404,15 +523,17 @@ def main():
         sys.exit(2)
 
     print(f"[信息] 报告日期 {date}，选取 {len(selected)} 只：",
-          ", ".join(f"{s['market']}{s['code']}" for s in selected))
+          ", ".join(f"{it['stock']['market']}{it['stock']['code']}" for it in selected))
 
     results = []
     total_cost = 0.0
-    for i, stock in enumerate(selected, 1):
+    for i, item in enumerate(selected, 1):
+        stock = item["stock"]
         code = f"{stock['market'].upper()}{stock['code']}"
-        quote = fetch_quote(stock)
+        quote = item.get("quote") or fetch_quote(stock)  # 筛选阶段已抓取则复用
         print(f"  [{i}/{len(selected)}] {code} {quote.get('name') or ''} "
-              f"现价={quote.get('price')} 数据={'OK' if quote.get('ok') else '未获取到'}")
+              f"现价={quote.get('price')} 数据={'OK' if quote.get('ok') else '未获取到'}"
+              + (f" 评分={item['score']}" if item.get('score') is not None else ""))
         if args.no_llm:
             analysis = {
                 "one_liner": "（离线自测占位，未调用LLM）",
@@ -438,13 +559,14 @@ def main():
                 usage = {}
         total_cost += (usage or {}).get("cost", 0) or 0
         dcf = run_dcf_crosscheck(analysis.get("dcf_assumptions"))
-        results.append({"stock": stock, "code": code, "quote": quote, "analysis": analysis, "dcf": dcf})
+        results.append({"stock": stock, "code": code, "quote": quote, "analysis": analysis,
+                        "dcf": dcf, "score": item.get("score"), "rank": item.get("rank")})
         time.sleep(0.3)
 
     # 排序：按建议动作（买入优先）
     results.sort(key=lambda r: ACTION_ORDER.get(r["analysis"].get("action"), 9))
 
-    title, md = render_markdown(date, results)
+    title, md = render_markdown(date, results, screen_stats)
     os.makedirs(args.outdir, exist_ok=True)
     out_path = os.path.join(args.outdir, f"{title}.md")
     with open(out_path, "w", encoding="utf-8") as f:
